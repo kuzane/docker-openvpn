@@ -1,0 +1,279 @@
+---
+# Source: openvpn/templates/config-openvpn.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openvpn
+  labels:
+    app: openvpn
+    release: openvpn
+data:
+  setup-certs.sh: |-
+    #!/bin/bash
+    EASY_RSA_LOC="/etc/openvpn/certs"
+    cd $EASY_RSA_LOC
+    SERVER_CERT="${EASY_RSA_LOC}/pki/issued/server.crt"
+    if [ -e "$SERVER_CERT" ]
+    then
+      echo "found existing certs - reusing"
+    else
+      cp -R /usr/share/easy-rsa/* $EASY_RSA_LOC
+      ./easyrsa init-pki
+      echo "ca\n" | ./easyrsa build-ca nopass
+      ./easyrsa build-server-full server nopass
+      ./easyrsa gen-dh
+    fi
+
+  newClientCert.sh: |-
+    #!/bin/bash
+    EASY_RSA_LOC="/etc/openvpn/certs"
+    cd $EASY_RSA_LOC
+    MY_IP_ADDR="$2"
+    ./easyrsa build-client-full $1 nopass
+    cat >${EASY_RSA_LOC}/pki/$1.ovpn <<EOF
+    client
+    nobind
+    dev tun
+    remote ${MY_IP_ADDR} 1194 tcp
+    cipher AES-256-GCM
+    auth-user-pass
+    #redirect-gateway def1  # 注释这个配置才能让其不生成0.0.0.0路由
+
+    <key>
+    `cat ${EASY_RSA_LOC}/pki/private/$1.key`
+    </key>
+    <cert>
+    `cat ${EASY_RSA_LOC}/pki/issued/$1.crt`
+    </cert>
+    <ca>
+    `cat ${EASY_RSA_LOC}/pki/ca.crt`
+    </ca>
+    EOF
+    cat pki/$1.ovpn
+
+  revokeClientCert.sh: |-
+    #!/bin/bash
+    EASY_RSA_LOC="/etc/openvpn/certs"
+    cd $EASY_RSA_LOC
+    ./easyrsa revoke $1
+    ./easyrsa gen-crl
+    cp ${EASY_RSA_LOC}/pki/crl.pem ${EASY_RSA_LOC}
+    chmod 644 ${EASY_RSA_LOC}/crl.pem
+
+  configure.sh: |-
+    #!/bin/sh
+
+    cidr2mask() {
+       # Number of args to shift, 255..255, first non-255 byte, zeroes
+       set -- $(( 5 - ($1 / 8) )) 255 255 255 255 $(( (255 << (8 - ($1 % 8))) & 255 )) 0 0 0
+       [ $1 -gt 1 ] && shift "$1" || shift
+       echo ${1-0}.${2-0}.${3-0}.${4-0}
+    }
+
+    cidr2net() {
+        local i ip mask netOctets octets
+        ip="${1%/*}"
+        mask="${1#*/}"
+        octets=$(echo "$ip" | tr '.' '\n')
+
+        for octet in $octets; do
+            i=$((i+1))
+            if [ $i -le $(( mask / 8)) ]; then
+                netOctets="$netOctets.$octet"
+            elif [ $i -eq  $(( mask / 8 +1 )) ]; then
+                netOctets="$netOctets.$((((octet / ((256 / ((2**((mask % 8)))))))) * ((256 / ((2**((mask % 8))))))))"
+            else
+                netOctets="$netOctets.0"
+            fi
+        done
+
+        echo ${netOctets#.}
+    }
+
+    /etc/openvpn/setup/setup-certs.sh
+
+
+
+
+    iptables -t nat -A POSTROUTING -s 10.240.0.0/255.255.0.0 -o eth0 -j MASQUERADE
+    mkdir -p /dev/net
+    if [ ! -c /dev/net/tun ]; then
+        mknod /dev/net/tun c 10 200
+    fi
+
+    if [ "$DEBUG" == "1" ]; then
+        echo ========== ${OVPN_CONFIG} ==========
+        cat "${OVPN_CONFIG}"
+        echo ====================================
+    fi
+
+    intAndIP="$(ip route get 8.8.8.8 | awk '/8.8.8.8/ {print $5 "-" $7}')"
+    int="${intAndIP%-*}"
+    ip="${intAndIP#*-}"
+    cidr="$(ip addr show dev "$int" | awk -vip="$ip" '($2 ~ ip) {print $2}')"
+
+    NETWORK="$(cidr2net $cidr)"
+    NETMASK="$(cidr2mask ${cidr#*/})"
+    DNS=$(cat /etc/resolv.conf | grep -v '^#' | grep nameserver | awk '{print $2}')
+    SEARCH=$(cat /etc/resolv.conf | grep -v '^#' | grep search | awk '{$1=""; print $0}')
+    FORMATTED_SEARCH=""
+    for DOMAIN in $SEARCH; do
+      FORMATTED_SEARCH="${FORMATTED_SEARCH}push \"dhcp-option DOMAIN-SEARCH ${DOMAIN}\"\n"
+    done
+    cp -f /etc/openvpn/setup/openvpn.conf /etc/openvpn/
+    sed 's|OVPN_K8S_SEARCH|'"${FORMATTED_SEARCH}"'|' -i /etc/openvpn/openvpn.conf
+    sed 's|OVPN_K8S_DNS|'"${DNS}"'|' -i /etc/openvpn/openvpn.conf
+    sed 's|NETWORK|'"${NETWORK}"'|' -i /etc/openvpn/openvpn.conf
+    sed 's|NETMASK|'"${NETMASK}"'|' -i /etc/openvpn/openvpn.conf
+
+    # exec openvpn process so it receives lifecycle signals
+    exec openvpn --config /etc/openvpn/openvpn.conf
+  openvpn.conf: |-
+    server 10.38.0.0 255.255.0.0
+    verb 3
+    key /etc/openvpn/certs/pki/private/server.key
+    ca /etc/openvpn/certs/pki/ca.crt
+    cert /etc/openvpn/certs/pki/issued/server.crt
+    dh /etc/openvpn/certs/pki/dh.pem
+    key-direction 0
+    keepalive 10 60
+    persist-key
+    persist-tun
+
+    data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:BF-CBC
+    cipher BF-CBC
+    proto tcp
+    port  443
+    dev tun0
+    status /tmp/openvpn-status.log
+
+    user nobody
+    group nogroup
+
+    push "route NETWORK NETMASK"
+
+    push "route 10.168.0.0 255.255.0.0"
+
+    push "route 192.168.0.0 255.255.0.0"
+
+    OVPN_K8S_SEARCH
+
+    push "dhcp-option DNS OVPN_K8S_DNS"
+
+    plugin /usr/lib/openvpn/plugins/openvpn-auth-ldap.so "/etc/openvpn/auth/ldap.conf"
+    ifconfig-pool-persist ipp.txt
+  ldap.conf: |-
+    <LDAP>
+            URL             ldap://xxxxxxxxxxxx:389
+            BindDN          cn=admin,dc=xxxxx,dc=com
+            Password        123456
+            Timeout         15
+            TLSEnable       no
+            FollowReferrals no
+    </LDAP>
+    <Authorization>
+            BaseDN          "dc=xxxx,dc=com"
+            SearchFilter    "(uid=%u)"
+            RequireGroup    false
+    </Authorization>
+---
+# Source: openvpn/templates/openvpn-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: openvpn
+  labels:
+    app: openvpn
+    release: openvpn
+spec:
+  ports:
+    - name: openvpn
+      port: 443
+      targetPort: 443
+      protocol: TCP
+      nodePort: 31194
+  selector:
+    app: openvpn
+    release: openvpn
+  type: NodePort
+---
+# Source: openvpn/templates/openvpn-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openvpn
+  labels:
+    app: openvpn
+    release: openvpn
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openvpn
+      release: openvpn
+  template:
+    metadata:
+      labels:
+        app: openvpn
+        release: openvpn
+      annotations:
+        checksum/config: 870460f847a4e868155ab52712a8224d008707a9233f55a5bdf3f6e2600df601
+    spec:
+      containers:
+        - name: openvpn
+          image: registry.cn-hangzhou.aliyuncs.com/sixx/openvpn
+          imagePullPolicy: Always
+          command: ["/etc/openvpn/setup/configure.sh"]
+          ports:
+            - containerPort: 443
+              name: openvpn
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+          readinessProbe:
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            successThreshold: 2
+            exec:
+              command:
+                - nc
+                - -z
+                - 127.0.0.1
+                - "443"
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "128Mi"
+          volumeMounts:
+            - mountPath: /etc/openvpn/setup
+              name: openvpn
+              readOnly: false
+            - mountPath: /etc/openvpn/certs
+              name: certs
+              readOnly: false
+            - mountPath: "/etc/openvpn/auth/ldap.conf"
+              name: ldap-conf
+              subPath: ldap.conf
+      volumes:
+        - name: openvpn
+          configMap:
+            name: openvpn
+            defaultMode: 0775
+        - name: certs
+          hostPath:
+            path: /data/ldap/config
+            type: DirectoryOrCreate
+        - name: tz-config
+          hostPath:
+            path: /etc/localtime
+            type: File
+        - name: ldap-conf
+          configMap:
+            name: openvpn
+            items:
+              - key: ldap.conf
+                path: ldap.conf
